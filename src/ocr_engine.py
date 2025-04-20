@@ -1,151 +1,125 @@
 import os
-import sys
 import argparse
 import logging
-from typing import List, Dict, Tuple
+from typing import Optional, List
 
-import fitz  # PyMuPDF
-from PIL import Image
-import pytesseract
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+except ImportError as e:
+    logging.error("Missing required OCR dependencies: %s", e)
+    raise
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format='%(asctime)s [%(levelname)s] %(message)s'
 )
-logger = logging.getLogger(__name__)
 
 
-def is_scanned_page(page: fitz.Page, text_threshold: int = 30) -> bool:
+def extract_text_from_pdf(pdf_path: str, language: str = 'eng') -> str:
     """
-    Determine if a page is scanned/image-only by checking text length.
-    If the extracted text length is below threshold, treat as scanned.
+    Extracts text from a single PDF file using Tesseract OCR.
     """
-    text = page.get_text("text").strip()
-    if len(text) < text_threshold:
-        return True
-    return False
-
-
-def ocr_image(image: Image.Image, lang: str = "eng") -> Tuple[str, float]:
-    """
-    Perform OCR on a PIL Image and return extracted text and average confidence.
-    """
-    data = pytesseract.image_to_data(image, lang=lang, output_type=pytesseract.Output.DICT)
-    texts = []
-    confidences = []
-    n_boxes = len(data["text"])
-    for i in range(n_boxes):
-        txt = data["text"][i].strip()
-        conf = int(data["conf"][i])
-        if txt:
-            texts.append(txt)
-            confidences.append(conf)
-    avg_conf = float(sum(confidences)) / len(confidences) if confidences else 0.0
-    full_text = " ".join(texts)
-    return full_text, avg_conf
-
-
-def extract_text_from_pdf(
-    input_path: str,
-    output_path: str,
-    lang: str = "eng"
-) -> str:
-    """
-    Extract text from a PDF file, using OCR for scanned pages.
-    Saves output to a .txt file at output_path and returns the text.
-    """
-    logger.info(f"Processing PDF: {input_path}")
+    logging.info("Starting OCR for %s (lang=%s)", pdf_path, language)
     try:
-        doc = fitz.open(input_path)
+        images = convert_from_path(pdf_path)
     except Exception as e:
-        logger.error(f"Failed to open {input_path}: {e}")
-        return ""
+        logging.error("Failed to convert PDF to images: %s", e)
+        raise
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    results: List[str] = []
-
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        page_number = page_num + 1
+    text_pages: List[str] = []
+    for i, page in enumerate(images, start=1):
         try:
-            if is_scanned_page(page):
-                logger.info(f"Page {page_number}: detected as scanned, performing OCR.")
-                pix = page.get_pixmap(dpi=300)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                text, conf = ocr_image(img, lang)
-                logger.info(f"Page {page_number}: OCR confidence avg={conf:.2f}")
-            else:
-                text = page.get_text("text")
-                conf = None
-                logger.info(f"Page {page_number}: extracted text n_chars={len(text)}")
-            if not text.strip():
-                logger.warning(f"Page {page_number}: no text extracted (skipped)")
-            results.append(text)
+            page_text = pytesseract.image_to_string(page, lang=language)
+            text_pages.append(page_text)
+            logging.debug("Extracted text from page %d of %s", i, pdf_path)
         except Exception as e:
-            logger.error(f"Page {page_number}: error during extraction: {e}")
+            logging.error("OCR failed on page %d of %s: %s", i, pdf_path, e)
 
-    full_text = "\n\n".join(results)
-    try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(full_text)
-        logger.info(f"Saved extracted text to {output_path}")
-    except Exception as e:
-        logger.error(f"Failed to save text file {output_path}: {e}")
-
+    full_text = "\n\n".join(text_pages)
+    logging.info("Completed OCR for %s, extracted %d pages", pdf_path, len(images))
     return full_text
 
 
-def process_input(
-    input_path: str,
-    output_dir: str,
-    lang: str = "eng"
-) -> Dict[str, str]:
+def process_input(input_path: str, output_path: Optional[str], language: str):
     """
-    Handle input which can be a file or directory, extract text for each PDF.
-    Returns a mapping of input PDF paths to extracted text.
+    Processes a single PDF or all PDFs in a directory, writing text outputs.
     """
-    extracted: Dict[str, str] = {}
     if os.path.isdir(input_path):
-        for fname in os.listdir(input_path):
-            if fname.lower().endswith(".pdf"):
-                in_pdf = os.path.join(input_path, fname)
-                out_txt = os.path.join(output_dir, os.path.splitext(fname)[0] + ".txt")
-                text = extract_text_from_pdf(in_pdf, out_txt, lang)
-                extracted[in_pdf] = text
-    elif os.path.isfile(input_path) and input_path.lower().endswith(".pdf"):
-        fname = os.path.basename(input_path)
-        out_txt = os.path.join(output_dir, os.path.splitext(fname)[0] + ".txt")
-        text = extract_text_from_pdf(input_path, out_txt, lang)
-        extracted[input_path] = text
+        if output_path and not os.path.exists(output_path):
+            os.makedirs(output_path, exist_ok=True)
+        pdf_files = [
+            os.path.join(input_path, f)
+            for f in os.listdir(input_path)
+            if f.lower().endswith('.pdf')
+        ]
+        logging.info("Found %d PDF files in directory %s", len(pdf_files), input_path)
+        for pdf in pdf_files:
+            basename = os.path.splitext(os.path.basename(pdf))[0]
+            out_file = (
+                os.path.join(output_path, basename + '.txt')
+                if output_path else
+                os.path.join(os.path.dirname(pdf), basename + '.txt')
+            )
+            text = extract_text_from_pdf(pdf, language)
+            with open(out_file, 'w', encoding='utf-8') as f:
+                f.write(text)
+            logging.info("Wrote OCR output to %s", out_file)
     else:
-        logger.error(f"Invalid input: {input_path} is not a PDF file or directory")
-    return extracted
+        basename = os.path.splitext(os.path.basename(input_path))[0]
+        if output_path:
+            if output_path.lower().endswith('.txt'):
+                out_file = output_path
+            else:
+                os.makedirs(output_path, exist_ok=True)
+                out_file = os.path.join(output_path, basename + '.txt')
+        else:
+            out_file = os.path.join(os.path.dirname(input_path), basename + '.txt')
+
+        text = extract_text_from_pdf(input_path, language)
+        with open(out_file, 'w', encoding='utf-8') as f:
+            f.write(text)
+        logging.info("Wrote OCR output to %s", out_file)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="OCR engine for scanned PDF text extraction using Tesseract"
-    )
-    parser.add_argument(
-        "--input", "-i",
-        required=True,
-        help="Input PDF file or directory containing PDFs"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        default="output",
-        help="Output directory for extracted text files"
-    )
-    parser.add_argument(
-        "--language", "-l",
-        default="eng",
-        help="Language for Tesseract OCR (e.g., eng, spa)"
-    )
-    args = parser.parse_args()
-
-    results = process_input(args.input, args.output, args.language)
-    logger.info(f"Extraction complete for {len(results)} document(s)")
+def main(
+    input_path: str = 'docs/sample.pdf',
+    output_path: str = 'docs/sample_ocr.txt',
+    language: str = 'eng'
+) -> str:
+    """
+    Testable main function demonstrating OCR from a sample PDF path.
+    """
+    return extract_text_from_pdf(input_path, language)
 
 
 if __name__ == "__main__":
-    main()
+    """
+    Example usage:
+      python ocr_engine.py --input path/to/input.pdf --output path/to/output.txt --language eng
+    """
+    parser = argparse.ArgumentParser(
+        description="Extract text from scanned PDFs using Tesseract OCR"
+    )
+    parser.add_argument(
+        '--input', '-i',
+        required=True,
+        help='Input PDF file or directory of PDFs'
+    )
+    parser.add_argument(
+        '--output', '-o',
+        help='Output text file or directory (defaults to input path with .txt extension)'
+    )
+    parser.add_argument(
+        '--language', '-l',
+        default='eng',
+        help='OCR language code (e.g., eng, spa)'
+    )
+
+    args = parser.parse_args()
+    try:
+        process_input(args.input, args.output, args.language)
+        logging.info("Processing completed successfully.")
+    except Exception as e:
+        logging.error("Processing failed: %s", e)
+        exit(1)
